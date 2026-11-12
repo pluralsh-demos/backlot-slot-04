@@ -70,7 +70,8 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
           app.log.error({ err, sqlstate }, "postgres pool error");
         })
       : undefined;
-  const orders = options.pool ?? (ownedPool ? toOrderDb(ownedPool) : undefined);
+  const ordersBase = options.pool ?? (ownedPool ? toOrderDb(ownedPool) : undefined);
+  const orders = ordersBase ? withConnectRetry(ordersBase) : undefined;
 
   app.decorateRequest("hostCookies", {
     getter() {
@@ -150,6 +151,47 @@ export function buildApp(options: BuildAppOptions = {}): FastifyInstance {
   });
 
   return app;
+}
+
+function isTransientConnectError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) return false;
+  if (!("code" in err)) return false;
+  const code = err.code;
+  return (
+    code === "ECONNREFUSED" ||
+    code === "ETIMEDOUT" ||
+    code === "ENOTFOUND" ||
+    code === "EHOSTUNREACH"
+  );
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withConnectRetry(db: OrderDb): OrderDb {
+  return {
+    ...db,
+    async connect() {
+      const maxAttempts = 3;
+      const delays = [50, 100];
+      let lastError: unknown;
+
+      for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        try {
+          return await db.connect();
+        } catch (err) {
+          lastError = err;
+          if (attempt < maxAttempts - 1 && isTransientConnectError(err)) {
+            await sleep(delays[attempt] ?? 100);
+            continue;
+          }
+          throw err;
+        }
+      }
+      throw lastError;
+    },
+  };
 }
 
 function toOrderDb(pool: Pool): OrderDb {

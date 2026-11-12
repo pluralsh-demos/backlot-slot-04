@@ -338,6 +338,64 @@ describe("poster meteor api", () => {
     );
     expect(db.calls.some((sql) => sql === "ROLLBACK")).toBe(true);
   });
+
+  it("retries transient connection failures and succeeds", async () => {
+    const db = memoryOrdersWithConnectRetry({
+      connectFailures: 2,
+      connectErrorCode: "ECONNREFUSED",
+      connectErrorMessage: "connect ECONNREFUSED 172.20.79.209:5432",
+    });
+    app = buildApp({ logStream: discardLogs, pool: db.pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(db.connectAttempts).toBe(3);
+    expect(db.calls.some((sql) => sql.includes("INSERT INTO orders"))).toBe(true);
+    expect(await counter(app, "transactions_total", 'result="success"')).toBe(1);
+  });
+
+  it("does not retry non-transient connection errors", async () => {
+    const db = memoryOrdersWithConnectRetry({
+      connectFailures: 1,
+      connectErrorCode: "28P01",
+      connectErrorMessage: "password authentication failed",
+    });
+    app = buildApp({ logStream: discardLogs, pool: db.pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(db.connectAttempts).toBe(1);
+    expect(db.calls).toEqual([]);
+  });
+
+  it("exhausts retry after max attempts for transient errors", async () => {
+    const db = memoryOrdersWithConnectRetry({
+      connectFailures: 3,
+      connectErrorCode: "ETIMEDOUT",
+      connectErrorMessage: "connect ETIMEDOUT",
+    });
+    app = buildApp({ logStream: discardLogs, pool: db.pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(db.connectAttempts).toBe(3);
+    expect(db.calls).toEqual([]);
+  });
 });
 
 function orderBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -465,4 +523,96 @@ function memoryOrders(options?: { failOn?: string; code?: string; message?: stri
       connect: async () => client,
     },
   };
+}
+
+function memoryOrdersWithConnectRetry(options: {
+  connectFailures: number;
+  connectErrorCode: string;
+  connectErrorMessage: string;
+}): {
+  pool: OrderDb;
+  calls: string[];
+  connectAttempts: number;
+} {
+  const calls: string[] = [];
+  const orders: StoredOrder[] = [];
+  let next = 12000;
+  let connectAttempts = 0;
+  const client = {
+    async query<T>(sql: string, params?: unknown[]): Promise<OrderQueryResult<T>> {
+      calls.push(sql);
+      if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") {
+        return { rows: [], rowCount: null };
+      }
+      if (sql.includes("INSERT INTO orders")) {
+        const subtotal = Number(params?.[2]);
+        const id = `order-${orders.length + 1}`;
+        const number = `PM-${next}`;
+        next += 1;
+        orders.push({
+          id,
+          number,
+          status: "received",
+          subtotal,
+          total: subtotal,
+          items: [],
+        });
+        return {
+          rows: [{ id, number, status: "received", subtotal, total: subtotal } as T],
+          rowCount: 1,
+        };
+      }
+      if (sql.includes("INSERT INTO order_items")) {
+        const order = orders.find((entry) => entry.id === params?.[0]);
+        if (!order) throw new Error("missing order");
+        order.items.push({
+          sku: String(params?.[1]),
+          size: String(params?.[2]),
+          frame: String(params?.[3]),
+          customText: params?.[4] === null || params?.[4] === undefined ? null : String(params[4]),
+          unitPrice: Number(params?.[5]),
+        });
+        return { rows: [], rowCount: 1 };
+      }
+      if (sql.includes("FROM orders")) {
+        const order = orders.find((entry) => entry.number === params?.[0]);
+        if (!order) return { rows: [], rowCount: 0 };
+        return {
+          rows: [
+            {
+              number: order.number,
+              status: order.status,
+              subtotal: order.subtotal,
+              total: order.total,
+              items: order.items,
+            } as T,
+          ],
+          rowCount: 1,
+        };
+      }
+      throw new Error(`unexpected sql: ${sql}`);
+    },
+    release() {},
+  };
+  const result = {
+    calls,
+    get connectAttempts() {
+      return connectAttempts;
+    },
+    pool: {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      connect: async () => {
+        connectAttempts += 1;
+        if (connectAttempts <= options.connectFailures) {
+          const error = new Error(options.connectErrorMessage) as Error & { code?: string };
+          error.code = options.connectErrorCode;
+          throw error;
+        }
+        return client;
+      },
+    },
+  };
+  return result;
 }
