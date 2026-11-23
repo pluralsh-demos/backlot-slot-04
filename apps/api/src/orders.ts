@@ -263,6 +263,67 @@ function noteDbError(log: FastifyBaseLogger, metrics: ReadMetrics, error: unknow
   log.error({ sqlstate, pgMessage }, "order query failed");
 }
 
+/** Node network errors that may be transient during connection acquisition. */
+const RETRIABLE_CONNECTION_CODES = new Set([
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "ENOTFOUND",
+  "EHOSTUNREACH",
+]);
+
+function isRetriableConnectionError(error: unknown): boolean {
+  if (typeof error === "object" && error !== null && "code" in error) {
+    const code = error.code;
+    return typeof code === "string" && RETRIABLE_CONNECTION_CODES.has(code);
+  }
+  return false;
+}
+
+async function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Retry connection acquisition for transient Node network errors only.
+ * Does NOT retry PostgreSQL errors or any error after connection is acquired.
+ * Bounded to 3 attempts with exponential backoff (50ms, 100ms).
+ */
+async function connectWithRetry(
+  db: OrderDb,
+  log: FastifyBaseLogger,
+  metrics: ReadMetrics,
+): Promise<OrderClient> {
+  const maxAttempts = 3;
+  const backoffMs = [0, 50, 100] as const; // First attempt has no delay
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      await sleep(backoffMs[attempt]!);
+    }
+
+    try {
+      const client = await db.connect();
+      return client;
+    } catch (error) {
+      const isLast = attempt === maxAttempts - 1;
+      const isRetriable = isRetriableConnectionError(error);
+
+      // Log and count this error attempt
+      noteDbError(log, metrics, error);
+
+      if (isLast || !isRetriable) {
+        throw new QueryFailed(error);
+      }
+
+      // Log retry attempt for non-final retriable errors
+      const errorCode = typeof error === "object" && error !== null && "code" in error ? error.code : "unknown";
+      log.warn({ attempt: attempt + 1, errorCode }, "retrying connection acquisition");
+    }
+  }
+
+  throw new Error("unreachable: retry loop should return or throw");
+}
+
 async function countedQuery<T>(
   log: FastifyBaseLogger,
   metrics: ReadMetrics,
@@ -321,7 +382,7 @@ export async function placeOrder(
   let client: OrderClient | undefined;
   let open = false;
   try {
-    const connected = await countedQuery(log, metrics, () => db.connect());
+    const connected = await connectWithRetry(db, log, metrics);
     client = connected;
     await countedQuery(log, metrics, () => connected.query("BEGIN"));
     open = true;
@@ -378,7 +439,7 @@ export async function readOrder(
 ): Promise<OrderResult> {
   let client: OrderClient | undefined;
   try {
-    const connected = await countedQuery(log, metrics, () => db.connect());
+    const connected = await connectWithRetry(db, log, metrics);
     client = connected;
     const selected = await countedQuery(log, metrics, () =>
       connected.query<OrderSelectRow>(SELECT_ORDER, [number]),

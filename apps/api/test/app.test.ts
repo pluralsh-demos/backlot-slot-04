@@ -365,6 +365,113 @@ describe("poster meteor api", () => {
     expect(dbError?.pgMessage).toBe("sorry, too many clients already");
     expect(db.calls).not.toContain("BEGIN");
   });
+
+  it("retries transient connection failures and succeeds", async () => {
+    const logs = captureLogs();
+    const db = memoryOrders({
+      failConnectUntil: 2,
+      code: "ECONNREFUSED",
+      message: "connect ECONNREFUSED 172.20.79.209:5432",
+    });
+    app = buildApp({ logStream: logs.stream, pool: db.pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(201);
+    const order = response.json<{ number: string; status: string }>();
+    expect(order.number).toMatch(/^PM-\d+$/);
+    expect(order.status).toBe("received");
+    expect(await counter(app, "transactions_total", 'result="success"')).toBe(1);
+    expect(await counter(app, "transactions_total", 'result="error"')).toBe(0);
+    expect(db.calls.some((sql) => sql === "BEGIN")).toBe(true);
+
+    const text = logs.text();
+    const retryLogs = logLines(text).filter((line) => line.msg === "retrying connection acquisition");
+    expect(retryLogs.length).toBe(2);
+    expect(retryLogs[0]?.attempt).toBe(1);
+    expect(retryLogs[0]?.errorCode).toBe("ECONNREFUSED");
+    expect(retryLogs[1]?.attempt).toBe(2);
+  });
+
+  it("exhausts retries for persistent transient connection failures", async () => {
+    const logs = captureLogs();
+    const db = memoryOrders({
+      failConnect: true,
+      code: "ETIMEDOUT",
+      message: "connect ETIMEDOUT",
+    });
+    app = buildApp({ logStream: logs.stream, pool: db.pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({ error: "We couldn't place your order" });
+    expect(await counter(app, "db_errors_total", 'sqlstate="ETIMEDOUT"')).toBe(3);
+    expect(await counter(app, "transactions_total", 'result="error"')).toBe(1);
+    expect(await counter(app, "transactions_total", 'result="success"')).toBe(0);
+
+    const text = logs.text();
+    const retryLogs = logLines(text).filter((line) => line.msg === "retrying connection acquisition");
+    expect(retryLogs.length).toBe(2);
+    expect(retryLogs[0]?.attempt).toBe(1);
+    expect(retryLogs[1]?.attempt).toBe(2);
+    expect(db.calls).not.toContain("BEGIN");
+  });
+
+  it("does not retry non-transient connection errors", async () => {
+    const logs = captureLogs();
+    const db = memoryOrders({
+      failConnect: true,
+      code: "53300",
+      message: "sorry, too many clients already",
+    });
+    app = buildApp({ logStream: logs.stream, pool: db.pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(await counter(app, "db_errors_total", 'sqlstate="53300"')).toBe(1);
+    expect(await counter(app, "transactions_total", 'result="error"')).toBe(1);
+
+    const text = logs.text();
+    const retryLogs = logLines(text).filter((line) => line.msg === "retrying connection acquisition");
+    expect(retryLogs.length).toBe(0);
+  });
+
+  it("does not retry query errors after connection", async () => {
+    const logs = captureLogs();
+    const db = memoryOrders({
+      failOn: "INSERT INTO orders",
+      code: "42703",
+      message: 'column "print_dimensions" of relation "orders" does not exist',
+    });
+    app = buildApp({ logStream: logs.stream, pool: db.pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(await counter(app, "db_errors_total", 'sqlstate="42703"')).toBe(1);
+
+    const text = logs.text();
+    const retryLogs = logLines(text).filter((line) => line.msg === "retrying connection acquisition");
+    expect(retryLogs.length).toBe(0);
+  });
 });
 
 function orderBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -418,6 +525,7 @@ type StoredOrder = {
 function memoryOrders(options?: {
   failOn?: string;
   failConnect?: boolean;
+  failConnectUntil?: number;
   code?: string;
   message?: string;
 }): {
@@ -427,6 +535,7 @@ function memoryOrders(options?: {
   const calls: string[] = [];
   const orders: StoredOrder[] = [];
   let next = 12000;
+  let connectAttempts = 0;
   const client = {
     async query<T>(sql: string, params?: unknown[]): Promise<OrderQueryResult<T>> {
       calls.push(sql);
@@ -495,7 +604,13 @@ function memoryOrders(options?: {
       idleCount: 0,
       waitingCount: 0,
       connect: async () => {
+        connectAttempts += 1;
         if (options?.failConnect) {
+          const error = new Error(options.message ?? "database error") as Error & { code?: string };
+          error.code = options.code ?? "XX000";
+          throw error;
+        }
+        if (options?.failConnectUntil !== undefined && connectAttempts <= options.failConnectUntil) {
           const error = new Error(options.message ?? "database error") as Error & { code?: string };
           error.code = options.code ?? "XX000";
           throw error;
