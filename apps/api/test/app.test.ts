@@ -365,6 +365,165 @@ describe("poster meteor api", () => {
     expect(dbError?.pgMessage).toBe("sorry, too many clients already");
     expect(db.calls).not.toContain("BEGIN");
   });
+
+  it("retries transient connection errors and succeeds on second attempt", async () => {
+    const logs = captureLogs();
+    let attempts = 0;
+    const pool = {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      connect: async () => {
+        attempts++;
+        if (attempts === 1) {
+          const error = new Error("connect ECONNREFUSED 172.20.79.209:5432") as Error & { code?: string };
+          error.code = "ECONNREFUSED";
+          throw error;
+        }
+        const orders: StoredOrder[] = [];
+        let next = 12000;
+        return {
+          async query<T>(sql: string, params?: unknown[]): Promise<OrderQueryResult<T>> {
+            if (sql === "BEGIN" || sql === "COMMIT") {
+              return { rows: [], rowCount: null };
+            }
+            if (sql.includes("INSERT INTO orders")) {
+              const id = `order-${next}`;
+              const number = `PM-${next++}`;
+              const subtotal = Number(params?.[2] ?? 0);
+              orders.push({ id, number, status: "received", subtotal, total: subtotal, items: [] });
+              return { rows: [{ id, number, status: "received", subtotal, total: subtotal } as T], rowCount: 1 };
+            }
+            if (sql.includes("INSERT INTO order_items")) {
+              const order = orders.find((entry) => entry.id === params?.[0]);
+              if (!order) throw new Error("missing order");
+              order.items.push({
+                sku: String(params?.[1]),
+                size: String(params?.[2]),
+                frame: String(params?.[3]),
+                customText: params?.[4] === null ? null : String(params?.[4]),
+                unitPrice: Number(params?.[5]),
+              });
+              return { rows: [], rowCount: 1 };
+            }
+            throw new Error(`unexpected sql: ${sql}`);
+          },
+          release() {},
+        };
+      },
+    };
+    app = buildApp({ logStream: logs.stream, pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(201);
+    expect(attempts).toBe(2);
+    expect(await counter(app, "transactions_total", 'result="success"')).toBe(1);
+    expect(await counter(app, "transactions_total", 'result="error"')).toBe(0);
+  });
+
+  it("does not retry non-transient connection errors", async () => {
+    const logs = captureLogs();
+    let attempts = 0;
+    const pool = {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      connect: async () => {
+        attempts++;
+        const error = new Error("too many clients") as Error & { code?: string };
+        error.code = "53300";
+        throw error;
+      },
+    };
+    app = buildApp({ logStream: logs.stream, pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(attempts).toBe(1);
+    expect(await counter(app, "db_errors_total", 'sqlstate="53300"')).toBe(1);
+    expect(await counter(app, "transactions_total", 'result="error"')).toBe(1);
+  });
+
+  it("exhausts retry attempts after three transient failures", async () => {
+    const logs = captureLogs();
+    let attempts = 0;
+    const pool = {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      connect: async () => {
+        attempts++;
+        const error = new Error("connect ETIMEDOUT") as Error & { code?: string };
+        error.code = "ETIMEDOUT";
+        throw error;
+      },
+    };
+    app = buildApp({ logStream: logs.stream, pool });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/orders",
+      payload: orderBody(),
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(attempts).toBe(3);
+    expect(await counter(app, "db_errors_total", 'sqlstate="ETIMEDOUT"')).toBe(1);
+    expect(await counter(app, "transactions_total", 'result="error"')).toBe(1);
+  });
+
+  it("retries transient connection errors for order lookup", async () => {
+    let attempts = 0;
+    const pool = {
+      totalCount: 0,
+      idleCount: 0,
+      waitingCount: 0,
+      connect: async () => {
+        attempts++;
+        if (attempts === 1) {
+          const error = new Error("connect ENOTFOUND postgres") as Error & { code?: string };
+          error.code = "ENOTFOUND";
+          throw error;
+        }
+        return {
+          async query<T>(sql: string, params?: unknown[]): Promise<OrderQueryResult<T>> {
+            if (sql.includes("FROM orders")) {
+              return {
+                rows: [
+                  {
+                    number: "PM-12345",
+                    status: "received",
+                    subtotal: 2800,
+                    total: 2800,
+                    items: [{ sku: "PM-PERSEID", size: "A3", frame: "none", customText: null, unitPrice: 2800 }],
+                  } as T,
+                ],
+                rowCount: 1,
+              };
+            }
+            throw new Error(`unexpected sql: ${sql}`);
+          },
+          release() {},
+        };
+      },
+    };
+    app = buildApp({ logStream: discardLogs, pool });
+
+    const response = await app.inject({ method: "GET", url: "/api/orders/PM-12345" });
+
+    expect(response.statusCode).toBe(200);
+    expect(attempts).toBe(2);
+  });
 });
 
 function orderBody(overrides: Record<string, unknown> = {}): Record<string, unknown> {
