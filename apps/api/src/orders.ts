@@ -1,6 +1,6 @@
 import type { FastifyBaseLogger } from "fastify";
 import { frames, getProduct, sizes } from "./catalog.js";
-import { sqlStateOf } from "./db.js";
+import { sqlStateOf, withConnectionRetry } from "./db.js";
 import type { ApiMetrics } from "./metrics.js";
 
 const CUSTOM_TEXT_MAX = 60;
@@ -321,7 +321,7 @@ export async function placeOrder(
   let client: OrderClient | undefined;
   let open = false;
   try {
-    const connected = await countedQuery(log, metrics, () => db.connect());
+    const connected = await countedQuery(log, metrics, () => withConnectionRetry(() => db.connect()));
     client = connected;
     await countedQuery(log, metrics, () => connected.query("BEGIN"));
     open = true;
@@ -378,7 +378,7 @@ export async function readOrder(
 ): Promise<OrderResult> {
   let client: OrderClient | undefined;
   try {
-    const connected = await countedQuery(log, metrics, () => db.connect());
+    const connected = await countedQuery(log, metrics, () => withConnectionRetry(() => db.connect()));
     client = connected;
     const selected = await countedQuery(log, metrics, () =>
       connected.query<OrderSelectRow>(SELECT_ORDER, [number]),
